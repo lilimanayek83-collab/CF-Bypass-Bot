@@ -5,6 +5,11 @@ Cloudflare Turnstile, downloads the file and uploads it to Telegram (wzgram + tg
 
 ## Setup
 ```bash
+wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sudo apt update
+sudo apt install -y ./google-chrome-stable_current_amd64.deb
+google-chrome --version
+
 sudo apt-get install -y xvfb ffmpeg      # plus Google Chrome
 pip install -r requirements.txt
 nano .env                                # fill API_ID, API_HASH, BOT_TOKEN

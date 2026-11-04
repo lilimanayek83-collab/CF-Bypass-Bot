@@ -1,0 +1,26 @@
+API_ID=12345
+API_HASH=your_api_hash
+BOT_TOKEN=123456:ABC...
+
+# comma separated user ids allowed to use the bot (empty = everyone)
+AUTH_USERS=
+
+# site account (the site needs a login before downloads)
+SITE_USER=your_username
+SITE_PASS=your_password
+# optional CSS selectors if auto-detection fails
+LOGIN_ICON_SELECTOR=
+LOGIN_SUBMIT_SELECTOR=
+
+DOWNLOAD_DIR=downloads
+# optional: http://user:pass@host:port
+PROXY=
+# keep false on servers, run with xvfb-run instead (headless gets flagged by Cloudflare)
+HEADLESS=false
+
+# optional CSS selectors if auto-detection fails
+DOWNLOAD_BTN_SELECTOR=a.dt-dl-open
+DOWNLOAD_LINK_SELECTOR=
+
+TURNSTILE_TIMEOUT=60
+MAX_RETRY=0

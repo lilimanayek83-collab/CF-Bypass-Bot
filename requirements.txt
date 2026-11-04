@@ -1,0 +1,5 @@
+wzgram[fast]
+tgcrypto
+botasaurus
+python-dotenv
+requests

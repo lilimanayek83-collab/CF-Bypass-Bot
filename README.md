@@ -13,7 +13,7 @@ google-chrome --version
 sudo apt-get install -y xvfb ffmpeg      # plus Google Chrome
 pip install -r requirements.txt
 nano .env                                # fill API_ID, API_HASH, BOT_TOKEN
-./run.sh                                 # or: xvfb-run -a python3 bot.py
+                                 ./run.sh# or: xvfb-run -a python3 bot.py
 ```
 (If your file explorer hides dotfiles, `ENV_FILL_ME.txt` is the same content: copy it to `.env`.)
 

@@ -1,0 +1,12 @@
+.env
+*.session
+*.session-journal
+*.session-shm
+*.session-wal
+*.session.lock
+profiles/
+output/
+downloads/
+__pycache__/
+*.pyc
+venv/

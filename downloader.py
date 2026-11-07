@@ -56,3 +56,40 @@ def fetch(info: dict, dest_dir: str, state: dict) -> str:
                 f.write(chunk)
                 state["done"] += len(chunk)
     return path
+
+
+def fetch_image(info: dict, url: str, dest_dir: str) -> str:
+    """Blocking. Download a poster/thumbnail with the browser's cookies, return a .jpg path."""
+    os.makedirs(dest_dir, exist_ok=True)
+    r = requests.get(
+        url, headers={"User-Agent": info["ua"], "Referer": info["referer"]},
+        cookies=info["cookies"], timeout=25,
+    )
+    r.raise_for_status()
+    ct = r.headers.get("content-type", "")
+    if "image" not in ct or len(r.content) > 9_000_000:
+        raise Exception("not a usable image")
+    raw = os.path.join(dest_dir, "img.bin")
+    out = os.path.join(dest_dir, "img.jpg")
+    with open(raw, "wb") as f:
+        f.write(r.content)
+    if "jpeg" in ct or "jpg" in ct:
+        os.replace(raw, out)
+        return out
+    subprocess.run(  # png/webp -> jpg so Telegram always accepts it
+        ["ffmpeg", "-y", "-i", raw, "-frames:v", "1", "-q:v", "3", out],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60,
+    )
+    return out
+
+
+def fetch_bytes(info: dict, url: str) -> bytes:
+    """Blocking. Small image download with the browser's cookies (poster grid tiles)."""
+    r = requests.get(
+        url, headers={"User-Agent": info["ua"], "Referer": info["referer"]},
+        cookies=info["cookies"], timeout=20,
+    )
+    r.raise_for_status()
+    if "image" not in r.headers.get("content-type", "") or len(r.content) > 5_000_000:
+        raise Exception("not a usable image")
+    return r.content

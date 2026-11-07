@@ -3,3 +3,4 @@ tgcrypto
 botasaurus
 python-dotenv
 requests
+Pillow

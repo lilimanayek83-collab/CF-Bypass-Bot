@@ -4,3 +4,5 @@ botasaurus
 python-dotenv
 requests
 Pillow
+motor
+dnspython

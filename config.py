@@ -9,6 +9,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 AUTH_USERS = {int(x) for x in os.getenv("AUTH_USERS", "").replace(" ", "").split(",") if x}
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "downloads")
+SESSION_DIR = os.getenv("SESSION_DIR", "").strip() or "."  # where the Telegram session file is kept
 PROXY = os.getenv("PROXY") or None
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 
@@ -18,7 +19,7 @@ PROFILE_NAME = os.getenv("PROFILE_NAME", "site_acc")
 LOGIN_ICON_SELECTOR = os.getenv("LOGIN_ICON_SELECTOR", "").strip()
 LOGIN_SUBMIT_SELECTOR = os.getenv("LOGIN_SUBMIT_SELECTOR", "").strip()
 
-DOWNLOAD_BTN_SELECTOR = os.getenv("DOWNLOAD_BTN_SELECTOR", "").strip()
+DOWNLOAD_BTN_SELECTOR = os.getenv("DOWNLOAD_BTN_SELECTOR", "").strip() or "a.dt-dl-open"
 DOWNLOAD_LINK_SELECTOR = (
     os.getenv("DOWNLOAD_LINK_SELECTOR", "").strip()
     or '#dt-dl-modal .dt-dl-options a[href], a[download]'
@@ -47,3 +48,10 @@ CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))                        # seconds 
 SERIES_URL_PATTERN = os.getenv("SERIES_URL_PATTERN", "").strip() or r"/tvshows?/[^/?#]+"
 LISTING_PER_SCREEN = max(2, min(12, int(os.getenv("LISTING_PER_SCREEN", "8"))))  # posters per Telegram screen
 BROWSE_PATH = os.getenv("BROWSE_PATH", "").strip() or "hentai-series/"           # what /browse opens
+
+# ---- admin automation pipeline (tasks are stored in MongoDB)
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+MONGO_URI = os.getenv("MONGO_URI", "").strip()
+MONGO_DB = os.getenv("MONGO_DB", "").strip() or "AnimePipeline"
+PIPELINE_DELAY = float(os.getenv("PIPELINE_DELAY", "8"))                          # seconds to rest between episodes
+PIPELINE_SOURCE = os.getenv("PIPELINE_SOURCE", "").strip() or "hentai-series/"    # what the site's home link means

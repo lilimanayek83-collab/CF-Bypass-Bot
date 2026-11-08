@@ -439,11 +439,16 @@ document.querySelectorAll('.dsc-stat').forEach(e => {
   const kk = (e.querySelector('span') || {}).innerText, v = (e.querySelector('b') || {}).innerText;
   if (kk && v && !/views/i.test(kk)) info.push(kk.trim() + ': ' + v.trim().replace(/\\s+/g, ' '));
 });
+const fields = {};
+document.querySelectorAll('.dsc-stat').forEach(e => {
+  const kk = (e.querySelector('span') || {}).innerText, v = (e.querySelector('b') || {}).innerText;
+  if (kk && v) fields[kk.trim().toLowerCase()] = v.trim().replace(/\\s+/g, ' ');
+});
 const alt = t('.dsc-alt');
 return {title: t('.dsc-title'), image: poster || og('og:image'),
         desc: t('.dsc-desc') || og('og:description'),
         genres: [...document.querySelectorAll('.dsc-genres a')].map(a => a.innerText.trim()).filter(Boolean),
-        info: info, alt: alt};
+        info: info, alt: alt, chips: chips, fields: fields};
 """
 
 CARD_LIB = """

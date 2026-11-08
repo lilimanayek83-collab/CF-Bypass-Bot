@@ -11,15 +11,21 @@ import time
 import uuid
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from urllib.parse import quote_plus, urlparse
 
+from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, enums, filters, idle
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from pyrogram.types import (BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup,
+                            InputMediaPhoto)
 
 import catalog
 import config
 from downloader import fetch, fetch_bytes, fetch_image
+import templating as T
+from pipeline import QUALITY_CHOICES, Pipeline, chan_name
 from scraper import SCRAPERS
+from store import Store
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -32,8 +38,10 @@ for noisy in ("pyrogram", "websocket"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
 
+os.makedirs(config.SESSION_DIR, exist_ok=True)
 app = Client(
     "cfdl",
+    workdir=config.SESSION_DIR,
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
@@ -46,6 +54,10 @@ SERIES_RE = re.compile(config.SERIES_URL_PATTERN, re.I)
 SITE_HOST = urlparse(config.SITE_URL).netloc.lower().removeprefix("www.")
 VIDEO_EXT = (".mp4", ".mkv", ".webm", ".mov")
 LINK_TTL = 20 * 60  # download links are only trusted for 20 minutes
+
+# ---- admin pipeline (created in main())
+DB = None
+PIPE = None
 
 # ---- concurrency state (created in main(), needs the running loop)
 SLOTS: asyncio.Queue = None            # free browser slot ids
@@ -117,10 +129,15 @@ async def safe_edit(msg, text, **kw):
 
 
 def _allowed(user_id) -> bool:
-    return not config.AUTH_USERS or user_id in config.AUTH_USERS
+    return not config.AUTH_USERS or user_id in config.AUTH_USERS or user_id in config.ADMIN_IDS
 
 
 is_auth = filters.create(lambda _, __, m: bool(m.from_user) and _allowed(m.from_user.id))
+
+# /add_task and template editing are small step-by-step conversations, kept per admin
+WIZ: dict = {}
+TEXT_STEPS = ("link", "file", "episode", "sub", "tpl")
+in_wizard = filters.create(lambda _, __, m: bool(m.from_user) and WIZ.get(m.from_user.id, {}).get("step") in TEXT_STEPS)
 
 
 # ------------------------------------------------------------------ captions / keyboards
@@ -699,8 +716,11 @@ def spawn(job_in):
 # ------------------------------------------------------------------ telegram handlers
 @app.on_message(filters.command(["start", "menu", "home"]) & filters.private & is_auth)
 async def start(_, m):
-    await m.reply_text(MENU_TEXT + "\n\nYou can also send a link (list, series or episode page).\n/status shows the load.",
+    await m.reply_text(MENU_TEXT + "\n\nYou can also send a link (list, series or episode page).\n"
+                       "/help lists every command. /status shows the load.",
                        parse_mode=HTML, reply_markup=menu_keyboard())
+    if m.from_user.id in config.ADMIN_IDS:
+        await register_commands(m.from_user.id)  # makes the admin commands show up in this admin's menu
 
 
 @app.on_message(filters.command("search") & filters.private & is_auth)
@@ -727,12 +747,12 @@ async def browse(_, m):
     spawn({"type": "listing", "m": m, "url": url, "uid": m.from_user.id, "screen": 0})
 
 
-@app.on_message(filters.private & filters.text & ~filters.regex(r"^https?://") & ~filters.regex(r"^/") & is_auth)
+@app.on_message(filters.private & filters.text & ~filters.regex(r"^https?://") & ~filters.regex(r"^/") & ~in_wizard & is_auth)
 async def on_text(_, m):
     await do_search(m, m.text)  # plain text = search
 
 
-@app.on_message(filters.private & filters.regex(r"^https?://\S+") & is_auth)
+@app.on_message(filters.private & filters.regex(r"^https?://\S+") & ~in_wizard & is_auth)
 async def on_link(_, m):
     url = m.text.strip().split()[0]
     kind = classify(url)
@@ -864,6 +884,371 @@ async def on_button(_, cq):
         return await cq.answer("Queued")
 
 
+# ------------------------------------------------------------------ commands menu + /help
+USER_COMMANDS = [
+    ("start", "Open the main menu"),
+    ("search", "Search by title: /search <title>"),
+    ("browse", "Browse all series"),
+    ("status", "Show the bot load"),
+    ("help", "Show all commands"),
+]
+ADMIN_COMMANDS = [
+    ("add_task", "Create an automation task (download + post)"),
+    ("tasks", "List tasks: pause, resume, retry, delete"),
+    ("templates", "Show the post templates and variables"),
+    ("set_sub_template", "Edit the anime post (sub channel) template"),
+    ("set_episode_template", "Edit the episode post template"),
+    ("set_file_template", "Edit the file caption template"),
+    ("reset_templates", "Restore the default templates"),
+    ("cancel", "Cancel the current add_task / template edit"),
+]
+ADMIN_NAMES = [c for c, _ in ADMIN_COMMANDS]
+is_admin = filters.create(lambda _, __, m: bool(m.from_user) and m.from_user.id in config.ADMIN_IDS)
+RAW = enums.ParseMode.DISABLED
+
+
+def variables_text():
+    return "\n".join(f"{{{k}}} — {v}" for k, v in T.VARIABLES.items())
+
+
+def help_text(admin):
+    lines = ["📖 <b>Help</b>", "Send a link, or just type a title to search.", "", "<b>Commands</b>"]
+    lines += [f"/{c} — {esc(d)}" for c, d in USER_COMMANDS]
+    if admin:
+        lines += ["", "🔐 <b>Admin: automation pipeline</b>"]
+        lines += [f"/{c} — {esc(d)}" for c, d in ADMIN_COMMANDS]
+        lines += ["", "<b>How a task works</b>",
+                  "Make me an admin of your 3 channels (permission to post messages), then send /add_task and answer: "
+                  "Link · Download (All) · Technique · Quality · File channel · Episode channel · Sub channel.",
+                  "• <b>Data Collect</b>: read all the data first, then download + post each episode.",
+                  "• <b>One by one</b>: read, download and post one anime, then the next.",
+                  "• <b>File channel</b>: the video files, with a full caption.",
+                  "• <b>Episode channel</b>: one post per episode, with a Download button to the file.",
+                  "• <b>Sub channel</b>: one post per anime, with episode-number buttons to the episode posts.",
+                  "Channels can be given as -100…, @username, https://t.me/name or an invite link.",
+                  "", "<b>Templates</b> (/templates, /set_sub_template …)",
+                  "&lt;text&gt; = bold · &lt;q&gt;text&lt;/q&gt; = quote · [label](https://link) = link",
+                  "Variables: " + esc(", ".join("{" + k + "}" for k in T.VARIABLES))]
+    return "\n".join(lines)
+
+
+async def register_commands(admin_id=None):
+    """Default menu for everyone; the full menu (with admin commands) only for the admins."""
+    try:
+        if admin_id is None:
+            await app.set_bot_commands([BotCommand(c, d) for c, d in USER_COMMANDS])
+        for aid in ([admin_id] if admin_id else sorted(config.ADMIN_IDS)):
+            try:
+                await app.set_bot_commands([BotCommand(c, d) for c, d in USER_COMMANDS + ADMIN_COMMANDS],
+                                           scope=BotCommandScopeChat(chat_id=aid))
+            except Exception as e:  # the admin has not started the bot yet
+                logging.info("admin menu for %s not set yet (%s); it is set when they send /start", aid, e)
+    except Exception as e:
+        logging.warning("could not set the commands menu: %s", e)
+
+
+@app.on_message(filters.command("help") & filters.private & is_auth)
+async def help_cmd(_, m):
+    await m.reply_text(help_text(m.from_user.id in config.ADMIN_IDS), parse_mode=HTML)
+
+
+async def pipe_ready(m):
+    if PIPE is None:
+        await m.reply_text("⚠️ The database is not connected. Set MONGO_URI in the .env file and restart the bot.")
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ /add_task wizard
+CH_HELP = ("Send it as <code>-1001234567890</code>, <code>@username</code>, <code>https://t.me/name</code> or an "
+           "invite link <code>https://t.me/+abc…</code>.\nMake me an <b>admin</b> there first (allowed to post messages).")
+STEP_TEXT = {
+    "link": "🔗 <b>Link</b>\nSend the link to work on: a list page (all its pages), one series page, or one episode page.\n"
+            "Example: https://hentaimama.io/hentai-series/",
+    "file": "📁 <b>File channel</b> — the video files are saved here.\n" + CH_HELP,
+    "episode": "🎞 <b>Episode channel</b> — one post per episode, with a Download button.\n" + CH_HELP,
+    "sub": "📚 <b>Sub channel</b> — one post per anime, with episode-number buttons.\n" + CH_HELP,
+}
+STEP_ORDER = ["link", "download", "technique", "quality", "file", "episode", "sub", "confirm"]
+
+
+def kb_rows(rows):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
+
+
+async def wizard_ask(target, step):
+    """Send the question for a step (buttons for the choice steps, plain text for the others)."""
+    if step in STEP_TEXT:
+        return await target.reply_text(STEP_TEXT[step] + "\n\n/cancel to stop.", parse_mode=HTML)
+    if step == "download":
+        return await target.reply_text("⬇️ <b>Download</b>", parse_mode=HTML,
+                                       reply_markup=kb_rows([[("✅ All", "wz|dl|all"), ("Custom (off for now)", "wz|dl|custom")]]))
+    if step == "technique":
+        return await target.reply_text(
+            "⚙️ <b>Technique</b>\n🗂 <b>Data Collect</b> — read all the data first, then download + post each episode.\n"
+            "➡️ <b>One by one</b> — read, download and post one anime, then the next anime.",
+            parse_mode=HTML, reply_markup=kb_rows([[("🗂 Data Collect", "wz|tech|collect"), ("➡️ One by one", "wz|tech|onebyone")]]))
+    if step == "quality":
+        return await target.reply_text("🎚 <b>Quality</b>", parse_mode=HTML, reply_markup=kb_rows(
+            [[("All", "wz|q|all"), ("1080p", "wz|q|1080p")], [("720p", "wz|q|720p"), ("480p", "wz|q|480p")]]))
+    return None
+
+
+def wizard_summary(d):
+    tech = "Data Collect" if d["technique"] == "collect" else "One by one"
+    return ("📝 <b>Check the task</b>\n"
+            f"🔗 {esc(d['link'])} ({d['kind']})\n⬇️ Download: All · ⚙️ {tech} · 🎚 {d['quality']}\n"
+            f"📁 File: {esc(chan_name(d['file']))}\n🎞 Episode: {esc(chan_name(d['episode']))}\n"
+            f"📚 Sub: {esc(chan_name(d['sub']))}")
+
+
+async def resolve_channel(text):
+    t = text.strip()
+    m = re.match(r"^(?:https?://)?t\.me/c/(\d+)", t)
+    if m:
+        ident = int("-100" + m.group(1))
+    elif re.fullmatch(r"-?\d{5,}", t):
+        ident = int(t)
+    elif re.match(r"^(?:https?://)?t\.me/(?:\+|joinchat/)", t):
+        ident = t if t.startswith("http") else "https://" + t
+    elif re.match(r"^(?:https?://)?t\.me/[A-Za-z0-9_]{4,}", t):
+        ident = re.match(r"^(?:https?://)?t\.me/([A-Za-z0-9_]{4,})", t).group(1)
+    else:
+        ident = t.lstrip("@")
+    return await app.get_chat(ident)
+
+
+async def check_channel(chat):
+    """The bot must be an admin that can post. Returns (channel dict, None) or (None, error text)."""
+    name = esc(getattr(chat, "title", None) or str(chat.id))
+    try:
+        me = await app.get_chat_member(chat.id, "me")
+    except Exception as e:
+        return None, f"❌ I can't see <b>{name}</b> ({esc(str(e))}).\nAdd me to that channel as an admin first."
+    can_post = getattr(getattr(me, "privileges", None), "can_post_messages", True)
+    if me.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER) or can_post is False:
+        return None, f"❌ I'm not an admin with permission to post in <b>{name}</b>. Make me an admin, then send it again."
+    return {"id": chat.id, "title": getattr(chat, "title", None), "username": getattr(chat, "username", None)}, None
+
+
+@app.on_message(filters.command("add_task") & filters.private & is_admin)
+async def add_task_cmd(_, m):
+    if not await pipe_ready(m):
+        return
+    WIZ[m.from_user.id] = {"step": "link", "data": {}}
+    await wizard_ask(m, "link")
+
+
+@app.on_message(filters.command("cancel") & filters.private & is_admin)
+async def cancel_cmd(_, m):
+    await m.reply_text("Cancelled. 👍" if WIZ.pop(m.from_user.id, None) else "Nothing to cancel.")
+
+
+@app.on_message(filters.private & filters.text & ~filters.regex(r"^/") & is_admin & in_wizard)
+async def wizard_text(_, m):
+    uid, text = m.from_user.id, m.text.strip()
+    w = WIZ[uid]
+    step, d = w["step"], w.setdefault("data", {})
+
+    if step == "tpl":
+        return await save_template(m, w["name"], m.text)
+
+    if step == "link":
+        url = text.split()[0]
+        kind = classify(url) if url.startswith("http") else None
+        if not kind:
+            return await m.reply_text(f"❌ I only handle links from {SITE_HOST}. Send the link again.")
+        if urlparse(url).path.strip("/") == "" and not urlparse(url).query:
+            url, kind = site_url(config.PIPELINE_SOURCE), "listing"  # the site's home = every series
+            await m.reply_text(f"ℹ️ That's the home page, so I'll take every series from {url}")
+        d["link"], d["kind"] = url, kind
+        w["step"] = "download"
+        return await wizard_ask(m, "download")
+
+    if step in ("file", "episode", "sub"):
+        try:
+            chat = await resolve_channel(text)
+        except Exception as e:
+            return await m.reply_text(f"❌ I can't find that channel ({esc(str(e))}).\nMake me an admin there, then send it "
+                                      "again (an @username or link works best).", parse_mode=HTML)
+        ch, err = await check_channel(chat)
+        if err:
+            return await m.reply_text(err, parse_mode=HTML)
+        d[step] = ch
+        nxt = {"file": "episode", "episode": "sub", "sub": "confirm"}[step]
+        w["step"] = nxt
+        await m.reply_text(f"✅ {step.capitalize()} channel: {esc(chan_name(ch))}", parse_mode=HTML)
+        if nxt == "confirm":
+            return await m.reply_text(wizard_summary(d), parse_mode=HTML,
+                                      reply_markup=kb_rows([[("✅ Start the task", "wz|go"), ("❌ Cancel", "wz|cancel")]]))
+        return await wizard_ask(m, nxt)
+
+
+@app.on_callback_query(filters.regex(r"^wz\|"))
+async def on_wizard(_, cq):
+    uid = cq.from_user.id
+    if uid not in config.ADMIN_IDS:
+        return await cq.answer("Admin only", show_alert=True)
+    w = WIZ.get(uid)
+    parts = cq.data.split("|")
+    act, arg = parts[1], (parts[2] if len(parts) > 2 else "")
+    if not w:
+        return await cq.answer("This setup expired. Send /add_task again.", show_alert=True)
+    d = w["data"]
+    if act == "cancel":
+        WIZ.pop(uid, None)
+        await safe_edit(cq.message, "❌ Cancelled.")
+        return await cq.answer()
+    if act == "dl":
+        if arg == "custom":
+            return await cq.answer("Custom download is not available yet.", show_alert=True)
+        d["download"], w["step"] = "all", "technique"
+        await safe_edit(cq.message, "⬇️ Download: <b>All</b>", parse_mode=HTML)
+    elif act == "tech":
+        d["technique"], w["step"] = arg, "quality"
+        await safe_edit(cq.message, "⚙️ Technique: <b>" + ("Data Collect" if arg == "collect" else "One by one") + "</b>", parse_mode=HTML)
+    elif act == "q":
+        d["quality"], w["step"] = arg, "file"
+        await safe_edit(cq.message, f"🎚 Quality: <b>{esc(arg)}</b>", parse_mode=HTML)
+    elif act == "go":
+        if w["step"] != "confirm":
+            return await cq.answer("Finish the questions first.", show_alert=True)
+        tid = await PIPE.add_task({"admin_id": uid, "link": d["link"], "kind": d["kind"], "download": d["download"],
+                                   "technique": d["technique"], "quality": d["quality"], "file_channel": d["file"],
+                                   "episode_channel": d["episode"], "sub_channel": d["sub"]})
+        WIZ.pop(uid, None)
+        await safe_edit(cq.message, f"✅ <b>Task #{tid} started.</b>\n/tasks shows the progress.", parse_mode=HTML)
+        return await cq.answer("Started")
+    await cq.answer()
+    await wizard_ask(cq.message, w["step"])
+
+
+# ------------------------------------------------------------------ tasks panel
+STATUS_ICON = {"running": "▶️", "paused": "⏸", "done": "✅"}
+
+
+async def tasks_view():
+    tasks = await DB.all_tasks()
+    if not tasks:
+        return "No tasks yet. Create one with /add_task.", None
+    lines, rows = ["📋 <b>Tasks</b>"], []
+    for t in tasks:
+        c = await DB.counts(t["_id"])
+        eps = c["episodes"]
+        lines.append(f"#{t['_id']} {STATUS_ICON.get(t['status'], '•')} {esc(clip(t['link'], 45))} — "
+                     f"{eps['done']}/{sum(eps.values())} episodes")
+        rows.append([InlineKeyboardButton(f"#{t['_id']} {STATUS_ICON.get(t['status'], '•')} {clip(t['link'].split('//')[-1], 28)}",
+                                          callback_data=f"tk|open|{t['_id']}")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def task_view(tid):
+    t = await DB.task(tid)
+    if not t:
+        return "That task no longer exists.", kb_rows([[("⬅️ Back", "tk|list|0")]])
+    top = [("⏸ Pause", f"tk|pause|{tid}")] if t["status"] == "running" else (
+        [("▶️ Resume", f"tk|resume|{tid}")] if t["status"] == "paused" else [])
+    rows = ([top] if top else []) + [[("🔁 Retry failed", f"tk|retry|{tid}"), ("🔄 Refresh", f"tk|open|{tid}")],
+                                     [("🗑 Delete", f"tk|del|{tid}"), ("⬅️ Back", "tk|list|0")]]
+    return await PIPE.status_text(tid), kb_rows(rows)
+
+
+@app.on_message(filters.command("tasks") & filters.private & is_admin)
+async def tasks_cmd(_, m):
+    if not await pipe_ready(m):
+        return
+    text, kb = await tasks_view()
+    await m.reply_text(text, parse_mode=HTML, reply_markup=kb)
+
+
+@app.on_callback_query(filters.regex(r"^tk\|"))
+async def on_task_button(_, cq):
+    if cq.from_user.id not in config.ADMIN_IDS:
+        return await cq.answer("Admin only", show_alert=True)
+    if PIPE is None:
+        return await cq.answer("Database not connected", show_alert=True)
+    parts = cq.data.split("|")
+    act, tid = parts[1], int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+    note = None
+    if act == "list":
+        text, kb = await tasks_view()
+        await safe_edit(cq.message, text, parse_mode=HTML, reply_markup=kb)
+        return await cq.answer()
+    if act == "pause":
+        await PIPE.pause(tid)
+        note = "Paused (it stops after the current episode)"
+    elif act == "resume":
+        await PIPE.resume(tid)
+        note = "Resumed"
+    elif act == "retry":
+        n = await PIPE.retry(tid)
+        note = f"{n} episode(s) queued again" if n else "Nothing failed"
+    elif act == "del":
+        await safe_edit(cq.message, f"🗑 Delete task #{tid} and its saved data? Posts already made stay in the channels.",
+                        reply_markup=kb_rows([[("Yes, delete", f"tk|delok|{tid}"), ("No", f"tk|open|{tid}")]]))
+        return await cq.answer()
+    elif act == "delok":
+        await PIPE.delete(tid)
+        text, kb = await tasks_view()
+        await safe_edit(cq.message, text, parse_mode=HTML, reply_markup=kb)
+        return await cq.answer("Deleted")
+    text, kb = await task_view(tid)
+    await safe_edit(cq.message, text, parse_mode=HTML, reply_markup=kb)
+    await cq.answer(note)
+
+
+# ------------------------------------------------------------------ templates
+@app.on_message(filters.command("templates") & filters.private & is_admin)
+async def templates_cmd(_, m):
+    if not await pipe_ready(m):
+        return
+    parts = []
+    for name, label in T.TEMPLATE_NAMES.items():
+        parts.append(f"▸ {label} — change with /set_{name}_template\n{await DB.template(name)}")
+    await m.reply_text("\n\n".join(parts), parse_mode=RAW)
+    await m.reply_text("Variables:\n" + variables_text() + "\n\n<text> = bold · <q>text</q> = quote · [label](https://link) = link",
+                       parse_mode=RAW)
+
+
+async def save_template(m, name, text):
+    problems = T.check_template(text)
+    if problems:
+        return await m.reply_text("❌ " + "; ".join(problems) + "\nSend the template again, or /cancel.")
+    WIZ.pop(m.from_user.id, None)
+    await DB.set_template(name, text)
+    try:
+        await m.reply_text("✅ Saved. Preview:\n\n" + T.render(text, T.SAMPLE), parse_mode=HTML)
+    except Exception as e:
+        await m.reply_text(f"⚠️ Saved, but Telegram could not display the preview ({e}). Check the template.")
+
+
+@app.on_message(filters.command(["set_sub_template", "set_episode_template", "set_file_template"]) & filters.private & is_admin)
+async def set_template_cmd(_, m):
+    if not await pipe_ready(m):
+        return
+    name = m.command[0].split("_")[1]
+    inline = m.text.split(None, 1)[1] if len(m.text.split(None, 1)) > 1 else ""
+    if inline.strip():
+        return await save_template(m, name, inline)
+    WIZ[m.from_user.id] = {"step": "tpl", "name": name}
+    await m.reply_text(f"✏️ New template for the {T.TEMPLATE_NAMES[name]}.\nSend the whole text in one message "
+                       f"(or /cancel). Current one:\n\n{await DB.template(name)}\n\nVariables:\n{variables_text()}",
+                       parse_mode=RAW)
+
+
+@app.on_message(filters.command("reset_templates") & filters.private & is_admin)
+async def reset_templates_cmd(_, m):
+    if await pipe_ready(m):
+        await DB.reset_templates()
+        await m.reply_text("✅ All templates are back to the defaults.")
+
+
+@app.on_message(filters.command(ADMIN_NAMES) & filters.private & ~is_admin)
+async def not_admin(_, m):
+    await m.reply_text("🔒 This command is for the bot admins only." if config.ADMIN_IDS
+                       else "🔒 No admins are configured. Put your Telegram id in ADMIN_IDS in the .env file.")
+
+
 # ------------------------------------------------------------------ startup
 async def init_slot(i):
     """Start Chrome + log in, one slot at a time (staggered), then offer the slot to jobs."""
@@ -878,13 +1263,32 @@ async def init_slot(i):
 
 
 async def main():
-    global SLOTS, TRANSFERS
+    global SLOTS, TRANSFERS, DB, PIPE
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=32))  # downloads / ffmpeg / thumbnails
     SLOTS = asyncio.Queue()
     TRANSFERS = asyncio.Semaphore(config.MAX_TRANSFERS)
     EXECUTORS.extend(ThreadPoolExecutor(max_workers=1) for _ in range(config.BROWSER_WORKERS))
+    async def pipe_scrape(kind, url):
+        return await run_scrape(NullMsg(), new_job(), {"kind": kind, "url": url})
+
+    if config.MONGO_URI:
+        try:
+            DB = Store(AsyncIOMotorClient(config.MONGO_URI)[config.MONGO_DB])
+            await DB.init()
+            deps = SimpleNamespace(
+                scrape=pipe_scrape, fetch=fetch, fetch_image=fetch_image, video_meta=video_meta, transfers=TRANSFERS,
+                delay=config.PIPELINE_DELAY, max_size=config.MAX_SIZE, download_dir=config.DOWNLOAD_DIR)
+            PIPE = Pipeline(app, DB, deps)
+        except Exception:
+            logging.exception("MongoDB is not reachable: the admin pipeline is disabled")
+            DB = PIPE = None
+    else:
+        logging.warning("MONGO_URI is not set: the admin pipeline is disabled")
     await app.start()
+    if PIPE:
+        await PIPE.start_loop()  # resumes running tasks by itself after a restart
+    await register_commands()
     for i in range(config.BROWSER_WORKERS):
         asyncio.create_task(init_slot(i))
     await idle()

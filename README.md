@@ -27,4 +27,4 @@ nano .env                                # fill API_ID, API_HASH, BOT_TOKEN
 - Keep HEADLESS=false (headless gets flagged by Cloudflare).
 - Datacenter IPs (Codespaces/EC2) may fail Turnstile -> set PROXY (residential) or run on your own PC.
 - Debug screenshots are saved in output/screenshots/.
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------DEVELOP BY RAJAT NAYEK------------------------------------
